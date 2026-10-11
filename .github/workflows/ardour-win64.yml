@@ -123,8 +123,8 @@ jobs:
           $stack = Join-Path $env:USERPROFILE 'src\stack'
           Set-Location $stack
           xrepo update-repo
-          xmake f -c
-          xmake -vD
+          xmake f -c -y
+          xmake -y -vD
           if (-not (Test-Path (Join-Path $stack 'release\lib'))) { throw 'dependency stack not collected' }
 
       - name: Clone pinned Ardour 9.8 source
