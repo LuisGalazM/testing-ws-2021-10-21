@@ -21,8 +21,12 @@ jobs:
       - name: Runner info
         run: |
           Write-Host "OS: $([System.Environment]::OSVersion.VersionString)"
-          & "$env:ProgramFiles\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property displayName
-          & "$env:ProgramFiles\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationVersion
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (Test-Path $vswhere) {
+            & $vswhere -latest -property displayName
+            & $vswhere -latest -property installationVersion
+          }
+          $env:PATH = "C:\Program Files\LLVM\bin;$env:PATH"
           python --version
           git --version
           llvm-nm --version
