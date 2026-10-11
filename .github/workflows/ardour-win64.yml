@@ -1,9 +1,6 @@
 name: Build Ardour 9.8 Win64
 
 on:
-  push:
-    branches:
-      - ardour-9.8-win64-build
   workflow_dispatch:
 
 permissions:
