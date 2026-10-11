@@ -1,0 +1,175 @@
+name: Build Ardour 9.8 Win64
+
+on:
+  push:
+    branches:
+      - build/ardour-9.8-win64-20261011
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 180
+    steps:
+      - name: Checkout trigger repo
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2 UCRT64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            make
+            unzip
+            zip
+            rsync
+            nsis
+            python
+            base-devel
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-boost
+            mingw-w64-ucrt-x86_64-glib2
+            mingw-w64-ucrt-x86_64-glibmm
+            mingw-w64-ucrt-x86_64-libsndfile
+            mingw-w64-ucrt-x86_64-curl
+            mingw-w64-ucrt-x86_64-libarchive
+            mingw-w64-ucrt-x86_64-fftw
+            mingw-w64-ucrt-x86_64-liblo
+            mingw-w64-ucrt-x86_64-taglib
+            mingw-w64-ucrt-x86_64-vamp-plugin-sdk
+            mingw-w64-ucrt-x86_64-rubberband
+            mingw-w64-ucrt-x86_64-aubio
+            mingw-w64-ucrt-x86_64-portaudio-asio
+            mingw-w64-ucrt-x86_64-cairomm
+            mingw-w64-ucrt-x86_64-pangomm
+            mingw-w64-ucrt-x86_64-jack2
+            mingw-w64-ucrt-x86_64-serd
+            mingw-w64-ucrt-x86_64-sord
+            mingw-w64-ucrt-x86_64-sratom
+            mingw-w64-ucrt-x86_64-lv2
+            mingw-w64-ucrt-x86_64-lilv
+            mingw-w64-ucrt-x86_64-libwebsockets
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-libusb
+            mingw-w64-ucrt-x86_64-libjpeg-turbo
+            mingw-w64-ucrt-x86_64-lrdf
+            mingw-w64-ucrt-x86_64-lld
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-gettext
+
+      - name: Clone Ardour 9.8
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP"
+          git clone https://github.com/Ardour/ardour.git ardour
+          cd ardour
+          git checkout 9.8
+          git status --short
+          git describe --tags --always
+
+      - name: Configure Ardour
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/ardour"
+          export WAF_NO_PREFORK=1
+          python3 waf configure             --check-c-compiler=gcc             --check-cxx-compiler=g++             --dist-target=mingw             --prefix=/ucrt64             --configdir=share             --no-execstack             --no-dr-mingw             --cxx17             --ptformat             --optimize             --no-phone-home             --with-backends=portaudio,dummy,jack
+
+      - name: Build Ardour
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/ardour"
+          export WAF_NO_PREFORK=1
+          python3 waf -j2
+
+      - name: Patch official Windows packager for UCRT64
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/ardour"
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("tools/x-win/package.sh")
+          s = p.read_text()
+          s = s.replace("WITH_HARRISON_LV2=1", "WITH_HARRISON_LV2=")
+          s = s.replace("WITH_GMSYNTH=1", "WITH_GMSYNTH=")
+          s = s.replace("WITH_HARVID=1", "WITH_HARVID=")
+          s = s.replace("WITH_XJADEO=1", "WITH_XJADEO=")
+          s = s.replace(
+              "cp $PREFIX/bin/libportaudio-2.xp $DESTDIR/bin/ || cp $PREFIX/bin/libportaudio-2.dll $DESTDIR/bin/libportaudio-2.xp",
+              "cp $PREFIX/bin/libportaudio*.dll $DESTDIR/bin/ || true"
+          )
+          s = s.replace(
+              "elif test -z \"$LIVETRAX\" -a -z \"$VBM\"; then",
+              "elif false; then"
+          )
+          old = """if update-alternatives --query ${XPREFIX}-gcc | grep Value: | grep -q win32; then
+	cp /usr/lib/gcc/${XPREFIX}/*-win32/libgcc_s_*.dll $DESTDIR/bin/
+	cp /usr/lib/gcc/${XPREFIX}/*-win32/libstdc++-6.dll $DESTDIR/bin/
+elif update-alternatives --query ${XPREFIX}-gcc | grep Value: | grep -q posix; then
+	cp /usr/lib/gcc/${XPREFIX}/*-posix/libgcc_s_*.dll $DESTDIR/bin/
+	cp /usr/lib/gcc/${XPREFIX}/*-posix/libstdc++-6.dll $DESTDIR/bin/
+else
+	cp /usr/lib/gcc/${XPREFIX}/*/libgcc_s_sjlj-1.dll $DESTDIR/bin/
+	cp /usr/lib/gcc/${XPREFIX}/*/libstdc++-6.dll $DESTDIR/bin/
+fi
+
+if test -f /usr/${XPREFIX}/lib/libwinpthread-1.dll; then
+	cp /usr/${XPREFIX}/lib/libwinpthread-1.dll $DESTDIR/bin/
+fi"""
+          new = """cp /ucrt64/bin/libgcc_s_seh-1.dll $DESTDIR/bin/ 2>/dev/null || true
+cp /ucrt64/bin/libstdc++-6.dll $DESTDIR/bin/ 2>/dev/null || true
+cp /ucrt64/bin/libwinpthread-1.dll $DESTDIR/bin/ 2>/dev/null || true"""
+          if old in s:
+              s = s.replace(old, new)
+          else:
+              print("warning: compiler runtime block not matched")
+          s = s.replace(
+              "cp -r $PREFIX/etc/${LOWERCASE_DIRNAME}/* $DESTDIR/share/${LOWERCASE_DIRNAME}/",
+              "cp -r $PREFIX/etc/${LOWERCASE_DIRNAME}/* $DESTDIR/share/${LOWERCASE_DIRNAME}/ 2>/dev/null || true"
+          )
+          p.write_text(s)
+          PY
+          grep -nE 'WITH_(HARVID|XJADEO|GMSYNTH|HARRISON_LV2)|libportaudio|elif false|libgcc_s_seh' tools/x-win/package.sh | head -40
+
+      - name: Build Windows installer
+        shell: msys2 {0}
+        env:
+          XARCH: x86_64
+          PREFIX: /ucrt64
+          ROOT: /ucrt64
+          TMPDIR: /tmp
+          QUICKZIP: "1"
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/ardour"
+          mkdir -p /tmp/winsrc
+          bash tools/x-win/package.sh
+          ls -lah /tmp/Ardour-*-w64-Setup.exe
+          cp /tmp/Ardour-*-w64-Setup.exe "$GITHUB_WORKSPACE/Ardour-9.8-Windows-x64-Setup.exe"
+
+      - name: Hash installer
+        shell: pwsh
+        run: |
+          Get-FileHash .\Ardour-9.8-Windows-x64-Setup.exe -Algorithm SHA256 |
+            Format-List |
+            Out-File .\SHA256.txt
+          Get-Content .\SHA256.txt
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ardour-9.8-Windows-x64
+          path: |
+            Ardour-9.8-Windows-x64-Setup.exe
+            SHA256.txt
+          if-no-files-found: error
+          retention-days: 7
