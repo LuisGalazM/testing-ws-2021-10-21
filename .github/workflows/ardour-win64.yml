@@ -16,14 +16,352 @@ jobs:
       - name: Checkout helper repo
         uses: actions/checkout@v4
 
-      - name: Verify toolchain
+      - name: Initialize MSVC 2026 environment
         shell: pwsh
         run: |
           python --version
           git --version
           llvm-nm --version
-          & "$env:ProgramFiles\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          cl 2>&1 | Select-Object -First 3
+          $vsDevCmd = Get-ChildItem "$env:ProgramFiles\Microsoft Visual Studio\18" -Filter VsDevCmd.bat -Recurse -ErrorAction Stop | Select-Object -First 1
+          if (-not $vsDevCmd) { throw "VS 2026 VsDevCmd.bat not found" }
+          $cmd = "`"$($vsDevCmd.FullName)`" -arch=x64 -host_arch=x64 && set"
+          $vars = cmd.exe /d /s /c $cmd
+          foreach ($line in $vars) {
+            if ($line -match '^([^=]+)=(.*)
+      - name: Install xmake dev
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+          & ([ScriptBlock]::Create((Invoke-RestMethod https://xmake.io/psget.text))) -version dev
+          $paths = @(
+            "$env:LOCALAPPDATA\.xmake",
+            "$env:USERPROFILE\.xmake",
+            "$env:USERPROFILE\AppData\Local\.xmake"
+          )
+          $xmake = Get-ChildItem $paths -Filter xmake.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $xmake) { $xmake = Get-Command xmake.exe -ErrorAction SilentlyContinue }
+          if (-not $xmake) { throw "xmake.exe not found after installation" }
+          $xdir = Split-Path $xmake.Source
+          $xdir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & $xmake.Source --version
+
+      - name: Prepare Ardour dependency recipe
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\src\stack" | Out-Null
+          @'
+          set_policy("package.sync_requires_to_deps", true)
+          if is_mode("debug") then
+              add_requireconfs("**", {configs = {debug = true, shared = true}, system = false, build = true})
+          else
+              add_requireconfs("**", {configs = {shared = true}, system = false, build = true})
+          end
+
+          add_requires("libcurl")
+          add_requires("boost")
+          add_requires("libsndfile")
+          add_requires("libarchive")
+          add_requires("liblo")
+          add_requires("taglib")
+          add_requires("vamp-plugin-sdk")
+          add_requires("libusb")
+          add_requires("rubberband")
+          add_requires("jack2")
+          add_requires("fftw")
+          add_requires("aubio")
+          add_requires("libxml2")
+          add_requires("cppunit")
+          add_requires("libwebsockets")
+          add_requires("portaudio", {configs = {asio = true}})
+          add_requires("libsamplerate")
+          add_requires("lilv")
+          add_requires("libjpeg-turbo")
+          add_requires("lrdf")
+          add_requires("pangomm <2.48.0")
+          if is_plat("windows") then
+              add_requires("pthreads4w")
+          end
+
+          target("collect_deps")
+          set_kind("phony")
+          after_load(function()
+              import("core.project.config")
+              import("core.cache.localcache")
+              local dest = path.join(os.projectdir(), config.mode() or "release")
+              local subdirs = {"include", "lib"}
+              if is_plat("windows") then table.insert(subdirs, "bin") end
+              local skip = {python = true, cmake = true, ninja = true, meson = true, gperf = true}
+              local function pkgname(installdir)
+                  local parts = path.split(installdir)
+                  return parts[#parts - 2]
+              end
+              local refs = localcache.cache("references")
+              local pkgs = refs:get("packages") or {}
+              os.mkdir(dest)
+              for _, installdir in ipairs(pkgs) do
+                  if not skip[pkgname(installdir)] then
+                      for _, sub in ipairs(subdirs) do
+                          local src = path.join(installdir, sub)
+                          if sub == "lib" then
+                              for _, fp in ipairs(os.files(path.join(src, "**"))) do
+                                  local tgt = path.join(dest, sub, path.relative(fp, src))
+                                  os.mkdir(path.directory(tgt))
+                                  os.cp(fp, tgt)
+                              end
+                          elseif os.isdir(src) then
+                              os.cp(src, dest)
+                          end
+                      end
+                  end
+              end
+          end)
+          '@ | Set-Content -Path "$env:USERPROFILE\src\stack\xmake.lua" -Encoding utf8
+
+      - name: Build dependency stack
+        shell: pwsh
+        working-directory: C:\Users\runneradmin\src\stack
+        run: |
+          xrepo update-repo
+          xmake f -c
+          xmake -vD
+          if (-not (Test-Path ".\release\lib")) { throw "dependency stack not collected" }
+
+      - name: Clone Ardour 9.8 source
+        shell: pwsh
+        run: |
+          git clone https://github.com/Ardour/ardour.git "$env:USERPROFILE\src\ardour"
+          Set-Location "$env:USERPROFILE\src\ardour"
+          git checkout 22ed8656c2533e325322ff11831448e5123e0d4b
+          git submodule update --init --recursive
+          git rev-parse HEAD
+
+      - name: Configure and build Ardour
+        shell: pwsh
+        working-directory: C:\Users\runneradmin\src\ardour
+        run: |
+          $stack = "$env:USERPROFILE\src\stack\release"
+          $env:PATH = "$stack\bin;$env:PATH"
+          $env:PKG_CONFIG_PATH = "$stack\lib\pkgconfig"
+          python waf configure --prefix=C:\ArdourMSVC --configdir=share --ptformat --dist-target=msvc --cxx17 --optimize --also-include="$stack\include" --also-libdir="$stack\lib"
+          python waf -j2
+          python waf install
+
+      - name: Assemble portable package
+        shell: pwsh
+        run: |
+          $stage = "$env:GITHUB_WORKSPACE\artifact\Ardour-9.8-Windows-x64"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          if (Test-Path "C:\ArdourMSVC") {
+            Copy-Item "C:\ArdourMSVC\*" $stage -Recurse -Force
+          }
+
+          $stackBin = "$env:USERPROFILE\src\stack\release\bin"
+          if (Test-Path $stackBin) {
+            New-Item -ItemType Directory -Force -Path "$stage\bin" | Out-Null
+            Copy-Item "$stackBin\*.dll" "$stage\bin" -Force -ErrorAction SilentlyContinue
+          }
+
+          $exe = Get-ChildItem $stage -Filter "*ardour*.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) {
+            $exe = Get-ChildItem "$env:USERPROFILE\src\ardour\build" -Filter "*ardour*.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($exe) {
+              Copy-Item $exe.FullName "$stage\ardour.exe" -Force
+            }
+          }
+          if (-not (Get-ChildItem $stage -Filter "*.exe" -Recurse -ErrorAction SilentlyContinue)) {
+            throw "No Windows executable found"
+          }
+
+          $manifest = Get-ChildItem $stage -File -Recurse | ForEach-Object {
+            [PSCustomObject]@{
+              Path = $_.FullName.Substring($stage.Length + 1)
+              SHA256 = (Get-FileHash $_.FullName -Algorithm SHA256).Hash
+              Size = $_.Length
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 3 | Set-Content "$stage\SHA256SUMS.json" -Encoding utf8
+          Compress-Archive -Path "$stage\*" -DestinationPath "$env:GITHUB_WORKSPACE\Ardour-9.8-Windows-x64.zip" -Force
+
+      - name: Upload finished Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ardour-9.8-Windows-x64
+          path: Ardour-9.8-Windows-x64.zip
+          if-no-files-found: error
+          retention-days: 7
+) {
+              $name = $matches[1]
+              $value = $matches[2]
+              if ($name -match '^(PATH|INCLUDE|LIB|LIBPATH|VCINSTALLDIR|VCTools.*|VSINSTALLDIR|WindowsSdkDir|WindowsSDKVersion|UCRTVersion|UniversalCRTSdkDir)
+      - name: Install xmake dev
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+          & ([ScriptBlock]::Create((Invoke-RestMethod https://xmake.io/psget.text))) -version dev
+          $paths = @(
+            "$env:LOCALAPPDATA\.xmake",
+            "$env:USERPROFILE\.xmake",
+            "$env:USERPROFILE\AppData\Local\.xmake"
+          )
+          $xmake = Get-ChildItem $paths -Filter xmake.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $xmake) { $xmake = Get-Command xmake.exe -ErrorAction SilentlyContinue }
+          if (-not $xmake) { throw "xmake.exe not found after installation" }
+          $xdir = Split-Path $xmake.Source
+          $xdir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & $xmake.Source --version
+
+      - name: Prepare Ardour dependency recipe
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\src\stack" | Out-Null
+          @'
+          set_policy("package.sync_requires_to_deps", true)
+          if is_mode("debug") then
+              add_requireconfs("**", {configs = {debug = true, shared = true}, system = false, build = true})
+          else
+              add_requireconfs("**", {configs = {shared = true}, system = false, build = true})
+          end
+
+          add_requires("libcurl")
+          add_requires("boost")
+          add_requires("libsndfile")
+          add_requires("libarchive")
+          add_requires("liblo")
+          add_requires("taglib")
+          add_requires("vamp-plugin-sdk")
+          add_requires("libusb")
+          add_requires("rubberband")
+          add_requires("jack2")
+          add_requires("fftw")
+          add_requires("aubio")
+          add_requires("libxml2")
+          add_requires("cppunit")
+          add_requires("libwebsockets")
+          add_requires("portaudio", {configs = {asio = true}})
+          add_requires("libsamplerate")
+          add_requires("lilv")
+          add_requires("libjpeg-turbo")
+          add_requires("lrdf")
+          add_requires("pangomm <2.48.0")
+          if is_plat("windows") then
+              add_requires("pthreads4w")
+          end
+
+          target("collect_deps")
+          set_kind("phony")
+          after_load(function()
+              import("core.project.config")
+              import("core.cache.localcache")
+              local dest = path.join(os.projectdir(), config.mode() or "release")
+              local subdirs = {"include", "lib"}
+              if is_plat("windows") then table.insert(subdirs, "bin") end
+              local skip = {python = true, cmake = true, ninja = true, meson = true, gperf = true}
+              local function pkgname(installdir)
+                  local parts = path.split(installdir)
+                  return parts[#parts - 2]
+              end
+              local refs = localcache.cache("references")
+              local pkgs = refs:get("packages") or {}
+              os.mkdir(dest)
+              for _, installdir in ipairs(pkgs) do
+                  if not skip[pkgname(installdir)] then
+                      for _, sub in ipairs(subdirs) do
+                          local src = path.join(installdir, sub)
+                          if sub == "lib" then
+                              for _, fp in ipairs(os.files(path.join(src, "**"))) do
+                                  local tgt = path.join(dest, sub, path.relative(fp, src))
+                                  os.mkdir(path.directory(tgt))
+                                  os.cp(fp, tgt)
+                              end
+                          elseif os.isdir(src) then
+                              os.cp(src, dest)
+                          end
+                      end
+                  end
+              end
+          end)
+          '@ | Set-Content -Path "$env:USERPROFILE\src\stack\xmake.lua" -Encoding utf8
+
+      - name: Build dependency stack
+        shell: pwsh
+        working-directory: C:\Users\runneradmin\src\stack
+        run: |
+          xrepo update-repo
+          xmake f -c
+          xmake -vD
+          if (-not (Test-Path ".\release\lib")) { throw "dependency stack not collected" }
+
+      - name: Clone Ardour 9.8 source
+        shell: pwsh
+        run: |
+          git clone https://github.com/Ardour/ardour.git "$env:USERPROFILE\src\ardour"
+          Set-Location "$env:USERPROFILE\src\ardour"
+          git checkout 22ed8656c2533e325322ff11831448e5123e0d4b
+          git submodule update --init --recursive
+          git rev-parse HEAD
+
+      - name: Configure and build Ardour
+        shell: pwsh
+        working-directory: C:\Users\runneradmin\src\ardour
+        run: |
+          $stack = "$env:USERPROFILE\src\stack\release"
+          $env:PATH = "$stack\bin;$env:PATH"
+          $env:PKG_CONFIG_PATH = "$stack\lib\pkgconfig"
+          python waf configure --prefix=C:\ArdourMSVC --configdir=share --ptformat --dist-target=msvc --cxx17 --optimize --also-include="$stack\include" --also-libdir="$stack\lib"
+          python waf -j2
+          python waf install
+
+      - name: Assemble portable package
+        shell: pwsh
+        run: |
+          $stage = "$env:GITHUB_WORKSPACE\artifact\Ardour-9.8-Windows-x64"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          if (Test-Path "C:\ArdourMSVC") {
+            Copy-Item "C:\ArdourMSVC\*" $stage -Recurse -Force
+          }
+
+          $stackBin = "$env:USERPROFILE\src\stack\release\bin"
+          if (Test-Path $stackBin) {
+            New-Item -ItemType Directory -Force -Path "$stage\bin" | Out-Null
+            Copy-Item "$stackBin\*.dll" "$stage\bin" -Force -ErrorAction SilentlyContinue
+          }
+
+          $exe = Get-ChildItem $stage -Filter "*ardour*.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) {
+            $exe = Get-ChildItem "$env:USERPROFILE\src\ardour\build" -Filter "*ardour*.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($exe) {
+              Copy-Item $exe.FullName "$stage\ardour.exe" -Force
+            }
+          }
+          if (-not (Get-ChildItem $stage -Filter "*.exe" -Recurse -ErrorAction SilentlyContinue)) {
+            throw "No Windows executable found"
+          }
+
+          $manifest = Get-ChildItem $stage -File -Recurse | ForEach-Object {
+            [PSCustomObject]@{
+              Path = $_.FullName.Substring($stage.Length + 1)
+              SHA256 = (Get-FileHash $_.FullName -Algorithm SHA256).Hash
+              Size = $_.Length
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 3 | Set-Content "$stage\SHA256SUMS.json" -Encoding utf8
+          Compress-Archive -Path "$stage\*" -DestinationPath "$env:GITHUB_WORKSPACE\Ardour-9.8-Windows-x64.zip" -Force
+
+      - name: Upload finished Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ardour-9.8-Windows-x64
+          path: Ardour-9.8-Windows-x64.zip
+          if-no-files-found: error
+          retention-days: 7
+) {
+                "$name=$value" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+              }
+            }
+          }
+          cmd.exe /d /s /c "`"$($vsDevCmd.FullName)`" -arch=x64 -host_arch=x64 && cl 2>&1"
 
       - name: Install xmake dev
         shell: pwsh
