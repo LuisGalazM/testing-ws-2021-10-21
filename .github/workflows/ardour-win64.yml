@@ -1,0 +1,113 @@
+name: Build Ardour 9.8 Win64
+
+on:
+  push:
+    branches:
+      - ardour-9.8-win64-build
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Runner info
+        run: |
+          Write-Host "OS: $([System.Environment]::OSVersion.VersionString)"
+          & "$env:ProgramFiles\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property displayName
+          & "$env:ProgramFiles\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationVersion
+          python --version
+          git --version
+          llvm-nm --version
+
+      - name: Install xmake
+        run: |
+          Invoke-Expression (Invoke-WebRequest 'https://xmake.io/psget.text' -UseBasicParsing).Content
+          $xmake = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\xmake.exe'
+          if (Test-Path $xmake) { $env:PATH = "$(Split-Path $xmake);$env:PATH" }
+          xmake --version
+          xrepo --version
+
+      - name: Build Ardour dependency stack
+        run: |
+          $stack = Join-Path $env:USERPROFILE 'src\stack'
+          New-Item -ItemType Directory -Force -Path $stack | Out-Null
+          Invoke-WebRequest 'https://gist.githubusercontent.com/x42/0e3f7bf6380c086e9ff57f8f34298172/raw/ardour-depxs-xmakes.lua' -OutFile (Join-Path $stack 'xmake.lua')
+          Set-Location $stack
+          xrepo update-repo
+          xmake f -c -y
+          xmake -y
+          if (-not (Test-Path (Join-Path $stack 'release\lib'))) { throw 'Dependency stack did not produce release/lib' }
+
+      - name: Clone Ardour 9.8 source
+        run: |
+          Set-Location $env:GITHUB_WORKSPACE
+          git clone https://github.com/Ardour/ardour.git ardour-src
+          Set-Location ardour-src
+          git fetch --tags --force
+          git checkout 9.8
+          git rev-parse HEAD | Tee-Object -FilePath ..\ARDOUR_COMMIT.txt
+          git status --short --branch
+
+      - name: Configure and build Ardour
+        run: |
+          $stack = Join-Path $env:USERPROFILE 'src\stack\release'
+          $env:PATH = "$stack\bin;C:\Program Files\LLVM\bin;$env:PATH"
+          $env:PKG_CONFIG_PATH = "$stack\lib\pkgconfig"
+          Set-Location "$env:GITHUB_WORKSPACE\ardour-src"
+          python waf configure --prefix=C:\ArdourMSVC --configdir=share --ptformat --dist-target=msvc --cxx17 --optimize --also-include="$stack\include" --also-libdir="$stack\lib"
+          python waf -j2
+          python waf install
+
+      - name: Assemble portable package
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $prefix = 'C:\ArdourMSVC'
+          $stackBin = Join-Path $env:USERPROFILE 'src\stack\release\bin'
+          if (-not (Test-Path $prefix)) { throw 'C:\ArdourMSVC was not created' }
+
+          $exes = Get-ChildItem $prefix -Recurse -File -Filter '*.exe'
+          $ardour = $exes | Where-Object { $_.Name -match '^ardour.*\.exe$' } | Select-Object -First 1
+          if (-not $ardour) { throw 'ardour executable not found after install' }
+
+          if (Test-Path $stackBin) {
+            Get-ChildItem $stackBin -File -Filter '*.dll' | ForEach-Object {
+              $dst = Join-Path $ardour.DirectoryName $_.Name
+              if (-not (Test-Path $dst)) { Copy-Item $_.FullName $dst }
+            }
+          }
+
+          & $ardour.FullName --version
+
+          $meta = @(
+            'Ardour 9.8 Win64 - self-built from GPL source',
+            "Built: $([DateTime]::UtcNow.ToString('u')) UTC",
+            "Source commit: $(Get-Content $env:GITHUB_WORKSPACE\ARDOUR_COMMIT.txt)",
+            'Target: Windows x86_64',
+            'Toolchain: MSVC / Visual Studio 2026',
+            'Source: https://github.com/Ardour/ardour',
+            'Build guidance: https://ardour.org/building_msvc.html'
+          )
+          $meta | Set-Content -Encoding UTF8 (Join-Path $prefix 'BUILD-INFO.txt')
+
+          $zip = Join-Path $env:GITHUB_WORKSPACE 'Ardour-9.8-Win64-portable.zip'
+          Compress-Archive -Path "$prefix\*" -DestinationPath $zip -CompressionLevel Optimal
+          (Get-FileHash $zip -Algorithm SHA256).Hash + '  Ardour-9.8-Win64-portable.zip' | Set-Content -Encoding ascii (Join-Path $env:GITHUB_WORKSPACE 'SHA256SUMS.txt')
+
+      - name: Upload portable build
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ardour-9.8-Win64-portable
+          path: |
+            Ardour-9.8-Win64-portable.zip
+            SHA256SUMS.txt
+            ARDOUR_COMMIT.txt
+          if-no-files-found: error
+          retention-days: 7
