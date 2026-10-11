@@ -17,17 +17,18 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Initialize MSVC 2026 environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Verify toolchain
         shell: pwsh
         run: |
           python --version
           git --version
           llvm-nm --version
-          $vsDevCmd = Get-ChildItem "$env:ProgramFiles\Microsoft Visual Studio\18" -Filter VsDevCmd.bat -Recurse -ErrorAction Stop | Select-Object -First 1
-          if (-not $vsDevCmd) { throw "VS 2026 VsDevCmd.bat not found" }
-          $cmd = "`"$($vsDevCmd.FullName)`" -arch=x64 -host_arch=x64 && set"
-          $vars = cmd.exe /d /s /c $cmd
-          foreach ($line in $vars) {
-            if ($line -match '^([^=]+)=(.*)
+          cl 2>&1 | Select-Object -First 3
+
       - name: Install xmake dev
         shell: pwsh
         run: |
