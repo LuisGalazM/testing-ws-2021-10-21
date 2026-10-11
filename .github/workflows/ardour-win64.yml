@@ -34,8 +34,9 @@ jobs:
       - name: Install xmake
         run: |
           & ([ScriptBlock]::Create((Invoke-RestMethod 'https://xmake.io/psget.text')))
-          $xmake = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\xmake.exe'
-          if (Test-Path $xmake) { $env:PATH = "$(Split-Path $xmake);$env:PATH" }
+          $xmakeHome = Join-Path $env:USERPROFILE 'xmake'
+          if (Test-Path $xmakeHome) { $env:PATH = "$xmakeHome;$env:PATH" }
+          $xmakeHome | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           xmake --version
           xrepo --version
 
