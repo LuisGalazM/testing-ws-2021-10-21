@@ -1,6 +1,8 @@
 name: Build Ardour 9.8 Windows x64
 
 on:
+  push:
+    branches: [ "build/ardour-9.8-win64" ]
   pull_request:
     branches: [ main ]
   workflow_dispatch:
