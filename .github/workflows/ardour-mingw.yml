@@ -28,7 +28,7 @@ jobs:
             unzip
             zip
             rsync
-            nsis
+            mingw-w64-ucrt-x86_64-nsis
             python
             base-devel
             mingw-w64-ucrt-x86_64-toolchain
