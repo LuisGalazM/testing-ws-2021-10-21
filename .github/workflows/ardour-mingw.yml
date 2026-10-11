@@ -1,0 +1,177 @@
+name: Build Ardour 9.8 Win64 MinGW
+
+on:
+  push:
+    branches:
+      - ardour-9.8-win64-build
+    paths:
+      - '.github/workflows/ardour-mingw.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 120
+
+    steps:
+      - name: Set up MSYS2 UCRT64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            make
+            unzip
+            zip
+            rsync
+            nsis
+            python
+            base-devel
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-boost
+            mingw-w64-ucrt-x86_64-glib2
+            mingw-w64-ucrt-x86_64-glibmm
+            mingw-w64-ucrt-x86_64-libsndfile
+            mingw-w64-ucrt-x86_64-curl
+            mingw-w64-ucrt-x86_64-libarchive
+            mingw-w64-ucrt-x86_64-fftw
+            mingw-w64-ucrt-x86_64-liblo
+            mingw-w64-ucrt-x86_64-taglib
+            mingw-w64-ucrt-x86_64-vamp-plugin-sdk
+            mingw-w64-ucrt-x86_64-rubberband
+            mingw-w64-ucrt-x86_64-aubio
+            mingw-w64-ucrt-x86_64-portaudio-asio
+            mingw-w64-ucrt-x86_64-cairomm
+            mingw-w64-ucrt-x86_64-pangomm
+            mingw-w64-ucrt-x86_64-jack2
+            mingw-w64-ucrt-x86_64-serd
+            mingw-w64-ucrt-x86_64-sord
+            mingw-w64-ucrt-x86_64-sratom
+            mingw-w64-ucrt-x86_64-lv2
+            mingw-w64-ucrt-x86_64-lilv
+            mingw-w64-ucrt-x86_64-libwebsockets
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-libusb
+            mingw-w64-ucrt-x86_64-libjpeg-turbo
+            mingw-w64-ucrt-x86_64-lrdf
+            mingw-w64-ucrt-x86_64-lld
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-gettext
+
+      - name: Clone Ardour 9.8
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP"
+          git clone https://github.com/Ardour/ardour.git ardour
+          cd ardour
+          git checkout 9.8
+          git rev-parse HEAD | tee "$GITHUB_WORKSPACE/ARDOUR_COMMIT.txt"
+          git describe --tags --always
+
+      - name: Configure Ardour
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/ardour"
+          export WAF_NO_PREFORK=1
+          python3 waf configure \
+            --check-c-compiler=gcc \
+            --check-cxx-compiler=g++ \
+            --dist-target=mingw \
+            --prefix=/ucrt64 \
+            --configdir=share \
+            --no-execstack \
+            --no-dr-mingw \
+            --cxx17 \
+            --ptformat \
+            --optimize \
+            --no-phone-home \
+            --with-backends=portaudio,dummy,jack
+
+      - name: Build Ardour
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/ardour"
+          export WAF_NO_PREFORK=1
+          python3 waf -j2
+          python3 waf i18n
+
+      - name: Patch packager for UCRT64
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/ardour"
+          sed -i 's/^WITH_HARRISON_LV2=1/WITH_HARRISON_LV2=/' tools/x-win/package.sh
+          sed -i 's/^WITH_GMSYNTH=1/WITH_GMSYNTH=/' tools/x-win/package.sh
+          sed -i 's/^WITH_HARVID=1/WITH_HARVID=/' tools/x-win/package.sh
+          sed -i 's/^WITH_XJADEO=1/WITH_XJADEO=/' tools/x-win/package.sh
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("tools/x-win/package.sh")
+          s = p.read_text()
+          s = s.replace(
+              "cp $PREFIX/bin/libportaudio-2.xp $DESTDIR/bin/ || cp $PREFIX/bin/libportaudio-2.dll $DESTDIR/bin/libportaudio-2.xp",
+              "cp $PREFIX/bin/libportaudio*.dll $DESTDIR/bin/ || true"
+          )
+          s = s.replace("elif test -z \"$LIVETRAX\" -a -z \"$VBM\"; then", "elif false; then")
+          marker = "if update-alternatives --query"
+          if marker in s:
+              start = s.index(marker)
+              end_marker = "fi\n\nif test -f /usr/${XPREFIX}/lib/libwinpthread-1.dll; then"
+              end = s.find(end_marker, start)
+              if end != -1:
+                  end2 = s.find("fi", end + len(end_marker))
+                  if end2 != -1:
+                      end2 += 2
+                      repl = """cp /ucrt64/bin/libgcc_s_seh-1.dll $DESTDIR/bin/ 2>/dev/null || true
+          cp /ucrt64/bin/libstdc++-6.dll $DESTDIR/bin/ 2>/dev/null || true
+          cp /ucrt64/bin/libwinpthread-1.dll $DESTDIR/bin/ 2>/dev/null || true"""
+                      s = s[:start] + repl + s[end2:]
+          p.write_text(s)
+          PY
+
+      - name: Build Windows installer
+        shell: msys2 {0}
+        env:
+          XARCH: x86_64
+          PREFIX: /ucrt64
+          ROOT: /ucrt64
+          TMPDIR: /tmp
+          QUICKZIP: "1"
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/ardour"
+          mkdir -p /tmp/winsrc
+          bash tools/x-win/package.sh
+          installer="$(find /tmp -maxdepth 1 -type f -name 'Ardour-*-w64-Setup.exe' | head -1)"
+          test -n "$installer"
+          cp "$installer" "$GITHUB_WORKSPACE/Ardour-9.8-Windows-x64-Setup.exe"
+
+      - name: Verify and hash installer
+        shell: pwsh
+        run: |
+          $f = Get-Item .\Ardour-9.8-Windows-x64-Setup.exe
+          if ($f.Length -lt 10000000) { throw "Installer unexpectedly small: $($f.Length)" }
+          Get-FileHash $f.FullName -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash)  Ardour-9.8-Windows-x64-Setup.exe" } |
+            Set-Content -Encoding ascii .\SHA256SUMS.txt
+          Get-AuthenticodeSignature $f.FullName | Format-List Status,StatusMessage
+          Get-Content .\SHA256SUMS.txt
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ardour-9.8-Windows-x64
+          path: |
+            Ardour-9.8-Windows-x64-Setup.exe
+            SHA256SUMS.txt
+            ARDOUR_COMMIT.txt
+          if-no-files-found: error
+          retention-days: 7
